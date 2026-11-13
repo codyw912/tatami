@@ -266,8 +266,9 @@ final class ActionItem: NSMenuItem {
 // MARK: Tray
 
 // "tray tailscale" gets its own menu built from the Tailscale CLI, with a status dot and
-// the exit node in use. Any other entry is a bundle identifier: its icon, and a click
-// presses that app's real menu-bar item (needs the Accessibility permission).
+// the exit node in use. Any other entry is a bundle identifier: its icon while the app
+// runs, as its menu-bar item is there only then, and a click presses that app's real
+// menu-bar item (needs the Accessibility permission).
 final class Tray {
     static let tailscaleBundles = ["io.tailscale.ipn.macsys", "io.tailscale.ipn.macos"]
     var icons: [String: NSImage] = [:]
@@ -443,6 +444,10 @@ final class Bar: NSObject, NSApplicationDelegate {
         // Light and dark mode: the default colours are the system's dynamic ones.
         DistributedNotificationCenter.default().addObserver(forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
                                                             object: nil, queue: .main) { _ in self.view.needsDisplay = true }
+        // Apps that quit or start: their tray icons go and come, as in the menu bar.
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { _ in self.updateTray() }
+        }
         signal(SIGHUP, SIG_IGN)
         hup = DispatchSource.makeSignalSource(signal: SIGHUP, queue: .main)
         hup?.setEventHandler { self.loadConfig(); self.updateStatus(); self.updateTray(); self.refresh() }
@@ -498,9 +503,10 @@ final class Bar: NSObject, NSApplicationDelegate {
         DispatchQueue.global().async {
             let ts = cfg.tray.contains("tailscale") ? self.tray.tailscaleState(cfg) : (nil, "")
             DispatchQueue.main.async {
-                self.view.tray = cfg.tray.map { id in
-                    id == "tailscale" ? TrayItem(id: id, icon: self.tray.icon(id), dot: ts.0, text: ts.1)
-                                      : TrayItem(id: id, icon: self.tray.icon(id), dot: nil, text: "")
+                self.view.tray = cfg.tray.compactMap { id in
+                    if id == "tailscale" { return TrayItem(id: id, icon: self.tray.icon(id), dot: ts.0, text: ts.1) }
+                    if NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty { return nil }
+                    return TrayItem(id: id, icon: self.tray.icon(id), dot: nil, text: "")
                 }
                 self.view.needsDisplay = true
             }

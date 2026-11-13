@@ -44,9 +44,10 @@ Gaps between windows are tatami's own setting, in `tatami.conf`: `gap inner 10` 
 
 ## Tray
 
-`tray <bundle-id>` shows that app's icon; a click presses the app's real menu-bar item,
-so its own menu opens. If a menu-bar manager such as Bartender has moved that item off
-screen, macOS opens the menu where the item is, not under the bar.
+`tray <bundle-id>` shows that app's icon while the app runs, as the menu bar does; it
+goes when the app quits and comes back when it starts. A click presses the app's real
+menu-bar item, so its own menu opens. If a menu-bar manager such as Bartender has moved
+that item off screen, macOS opens the menu where the item is, not under the bar.
 
 `tray tailscale` gets a menu of its own from the Tailscale CLI, always under the icon:
 connect or disconnect, this device's address (click to copy), the exit node, and the
