@@ -39,6 +39,7 @@ struct BarConfig {
     var title = true
     var hoverReveal = true
     var tray: [String] = []
+    var openusageShow = "remaining"
     var tatami = ""
 
     func font(_ weight: NSFont.Weight) -> NSFont {
@@ -120,8 +121,13 @@ struct BarConfig {
         case "title": return bool { title = $0 }
         case "hover-reveal": return bool { hoverReveal = $0 }
         case "tray":
-            guard !v.isEmpty, !v.contains(" ") else { return "tray: expected one bundle identifier, tailscale or sound, got '\(v)'" }
+            guard !v.isEmpty, !v.contains(" ") else {
+                return "tray: expected one bundle identifier, tailscale, sound or openusage:<provider>, got '\(v)'"
+            }
             tray.append(v)
+        case "openusage-show":
+            guard v == "remaining" || v == "used" else { return "openusage-show: expected remaining or used, got '\(v)'" }
+            openusageShow = v
         case "tatami": tatami = (v as NSString).expandingTildeInPath
         default: return "unknown key '\(key)'"
         }
@@ -313,7 +319,10 @@ final class Tray {
         plugins = Dictionary(uniqueKeysWithValues: all.map { ($0.name, $0) })
     }
 
-    func icon(_ id: String) -> NSImage { plugins[id]?.icon() ?? appIcon(id) }
+    // A fixed plugin by name, or one made from the entry itself ("openusage:claude").
+    func plugin(_ id: String) -> TrayPlugin? { plugins[id] ?? OpenUsage(id: id, tray: self) }
+
+    func icon(_ id: String) -> NSImage { plugin(id)?.icon() ?? appIcon(id) }
 
     func appIcon(_ b: String) -> NSImage {
         if let i = icons[b] { return i }
@@ -567,6 +576,95 @@ final class Sound: TrayPlugin {
     }
 }
 
+// "tray openusage:<provider>[.<limit>]": one limit from OpenUsage
+// (github.com/robinebers/openusage), read from the command line tool inside the app. The tool
+// prints what the app last fetched and never fetches or launches anything itself. <provider>
+// is a provider kind (claude, codex, cursor, ...), which takes its first account, or one
+// account's id (codex@1a2b3c4d). <limit> is one of that account's resources, weekly when left
+// out. The icon is the provider's mark from the app; the text is what is left, or what is used
+// with "openusage-show used". A muted dot means the numbers are stale or missing: OpenUsage is
+// not running, its refreshes fail, or it has no such account or limit. A click opens
+// OpenUsage's own panel.
+final class OpenUsage: TrayPlugin {
+    static let bundle = "com.robinebers.openusage"
+    // One run of the tool serves every entry for a while: the app refreshes every 5 minutes.
+    static let lock = NSLock()
+    static var cached: (at: Date, providers: [String: [String: Any]])?
+
+    let name: String
+    let provider: String
+    let limit: String
+    unowned let tray: Tray
+
+    init?(id: String, tray: Tray) {
+        let prefix = "openusage:"
+        guard id.hasPrefix(prefix) else { return nil }
+        let parts = id.dropFirst(prefix.count).split(separator: ".", maxSplits: 1).map(String.init)
+        guard let first = parts.first else { return nil }
+        name = id
+        provider = first
+        limit = parts.count > 1 ? parts[1] : "weekly"
+        self.tray = tray
+    }
+
+    static var app: URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) }
+
+    // The kind names the mark: "codex@1a2b3c4d" is an account of codex.
+    var kind: String { String(provider.split(separator: "@").first ?? "") }
+
+    func icon() -> NSImage {
+        if let i = tray.icons[name] { return i }
+        let marks = "Contents/Resources/OpenUsage_OpenUsage.bundle/Contents/Resources/ProviderIcons"
+        var i = tray.appIcon(OpenUsage.bundle)
+        if let svg = OpenUsage.app?.appendingPathComponent("\(marks)/\(kind).svg"), let mark = NSImage(contentsOf: svg) {
+            // The marks are drawn in currentColor: a template, drawn in the bar's foreground.
+            mark.isTemplate = true
+            i = mark
+        }
+        tray.icons[name] = i
+        return i
+    }
+
+    static func providers() -> [String: [String: Any]]? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let c = cached, Date().timeIntervalSince(c.at) < 30 { return c.providers }
+        guard let cli = app?.appendingPathComponent("Contents/Helpers/openusage").path,
+              FileManager.default.isExecutableFile(atPath: cli) else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cli)
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        // Nothing fetched yet exits 4 and still prints the envelope, with no providers.
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let providers = json["providers"] as? [String: [String: Any]] else { return nil }
+        cached = (Date(), providers)
+        return providers
+    }
+
+    // Called off the main thread.
+    func state(_ cfg: BarConfig) -> (NSColor?, String) {
+        guard let providers = OpenUsage.providers() else { return (cfg.muted, "") }
+        let id = providers[provider] != nil ? provider : providers.keys.sorted().first { $0.hasPrefix(provider + "@") }
+        guard let account = id.flatMap({ providers[$0] }),
+              let r = (account["resources"] as? [String: [String: Any]])?[limit] else { return (cfg.muted, "") }
+        // A balance has what is available rather than a limit and what remains of it.
+        let value = cfg.openusageShow == "used" ? r["used"] : (r["remaining"] ?? r["available"])
+        guard let n = value as? NSNumber else { return (cfg.muted, "") }
+        let text = "\(Int(n.doubleValue.rounded()))" + (r["unit"] as? String == "percent" ? "%" : "")
+        return (account["stale"] as? Bool ?? false ? cfg.muted : nil, text)
+    }
+
+    func menu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void) {
+        tray.pressReal(OpenUsage.bundle, then: refresh)
+    }
+}
+
 // A small volume slider for a menu, between a quiet and a loud speaker. On macOS 26 the menu
 // and the slider take the system's Liquid Glass look.
 final class VolumeSlider: NSView {
@@ -706,7 +804,7 @@ final class Bar: NSObject, NSApplicationDelegate {
         let cfg = self.cfg
         DispatchQueue.global().async {
             var found: [String: (NSColor?, String)] = [:]
-            for id in cfg.tray { if let p = self.tray.plugins[id] { found[id] = p.state(cfg) } }
+            for id in cfg.tray { if let p = self.tray.plugin(id) { found[id] = p.state(cfg) } }
             let states = found
             DispatchQueue.main.async {
                 self.view.tray = cfg.tray.map { id in
@@ -718,7 +816,7 @@ final class Bar: NSObject, NSApplicationDelegate {
     }
 
     func pressTray(_ id: String) {
-        if let p = tray.plugins[id] {
+        if let p = tray.plugin(id) {
             if let r = view.trayRects.first(where: { $0.1 == id })?.0 { p.menu(in: view, at: r) { self.updateTray() } }
             return
         }
