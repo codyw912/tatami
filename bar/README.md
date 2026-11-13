@@ -70,6 +70,14 @@ what the app last fetched and never fetches itself. A muted dot means they are s
 missing: OpenUsage is not running, its refreshes fail, or the account has no such limit.
 A click opens OpenUsage's panel.
 
+`openusage-layout stacked` draws OpenUsage entries that sit next to each other in the
+tray two to a column, one above the other, with a smaller mark and number; a third starts
+a new column. `openusage-style meter` draws a small bar for what is left (or used) in place
+of the number. A limit with `openusage-warn` percent or less left (25 unless set) takes
+`openusage-warn-color`, and one with `openusage-critical` percent or less (10) takes
+`openusage-critical-color`; 0 turns either off. With the stacked layout a stale or missing
+number is drawn muted rather than with a dot.
+
 ### Plugins
 
 `tailscale`, `sound` and `openusage` are plugins: a class in `tatami-bar.swift` that

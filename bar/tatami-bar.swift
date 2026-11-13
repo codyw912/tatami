@@ -40,10 +40,18 @@ struct BarConfig {
     var hoverReveal = true
     var tray: [String] = []
     var openusageShow = "remaining"
+    var openusageLayout = "inline"
+    var openusageStyle = "percent"
+    // Percent left at or under which a limit takes the warn or the critical colour; 0 is off.
+    var openusageWarn = 25.0
+    var openusageCritical = 10.0
+    var openusageWarnColor: NSColor = .systemOrange
+    var openusageCriticalColor: NSColor = .systemRed
     var tatami = ""
 
-    func font(_ weight: NSFont.Weight) -> NSFont {
-        let base = NSFont.systemFont(ofSize: fontSize, weight: weight)
+    func font(_ weight: NSFont.Weight, size: CGFloat? = nil) -> NSFont {
+        let size = size ?? fontSize
+        let base = NSFont.systemFont(ofSize: size, weight: weight)
         let d: NSFontDescriptor.SystemDesign
         switch design {
         case .system: return base
@@ -52,7 +60,7 @@ struct BarConfig {
         case .serif: d = .serif
         }
         guard let desc = base.fontDescriptor.withDesign(d) else { return base }
-        return NSFont(descriptor: desc, size: fontSize) ?? base
+        return NSFont(descriptor: desc, size: size) ?? base
     }
 
     static var path: String { NSHomeDirectory() + "/.config/tatami/bar.conf" }
@@ -128,6 +136,17 @@ struct BarConfig {
         case "openusage-show":
             guard v == "remaining" || v == "used" else { return "openusage-show: expected remaining or used, got '\(v)'" }
             openusageShow = v
+        case "openusage-layout":
+            guard v == "inline" || v == "stacked" else { return "openusage-layout: expected inline or stacked, got '\(v)'" }
+            openusageLayout = v
+        case "openusage-style":
+            guard v == "percent" || v == "meter" else { return "openusage-style: expected percent or meter, got '\(v)'" }
+            openusageStyle = v
+        case "openusage-warn", "openusage-critical":
+            guard let n = Double(v), n >= 0, n <= 100 else { return "\(key): expected a percent from 0 to 100, got '\(v)'" }
+            if key == "openusage-warn" { openusageWarn = n } else { openusageCritical = n }
+        case "openusage-warn-color": return col { openusageWarnColor = $0 ?? .systemOrange }
+        case "openusage-critical-color": return col { openusageCriticalColor = $0 ?? .systemRed }
         case "tatami": tatami = (v as NSString).expandingTildeInPath
         default: return "unknown key '\(key)'"
         }
@@ -138,8 +157,22 @@ struct BarConfig {
 // MARK: Drawing
 
 struct Workspace { let index: Int; let focused: Bool; let label: String }
-// A menu-bar app shown in the bar: its icon, an optional status dot and text.
-struct TrayItem { let id: String; let icon: NSImage; let dot: NSColor?; let text: String }
+// A menu-bar app shown in the bar: its icon, an optional status dot and text, and how a
+// plugin wants the text drawn.
+struct TrayItem {
+    let id: String; let icon: NSImage; let dot: NSColor?; let text: String
+    var style = TrayStyle()
+}
+
+// How a plugin's text is drawn. color replaces the muted tray colour; gauge is a level
+// from 0 to 1 that meter draws as a bar in place of the text; compact entries stack two to
+// a column, smaller, in the order of the tray.
+struct TrayStyle {
+    var color: NSColor? = nil
+    var gauge: Double? = nil
+    var meter = false
+    var compact = false
+}
 
 final class BarView: NSView {
     var cfg = BarConfig()
@@ -257,9 +290,24 @@ final class BarView: NSView {
         r.draw(at: NSPoint(x: bounds.width - rs.width - 12, y: midY(rs.height)))
         trayRects = []
         var limit = bounds.width - rs.width - 12 - (rs.width > 0 ? 18 : 0)
-        for item in tray.reversed() {
-            let label = NSAttributedString(string: item.text, attributes: [.font: text, .foregroundColor: cfg.muted])
-            let lw = item.text.isEmpty ? 0 : label.size().width + 5
+        // Compact entries next to each other stack two to a column, the first on top.
+        var groups: [[TrayItem]] = []
+        for item in tray {
+            if item.style.compact, let last = groups.last, last.count < 2, last[0].style.compact {
+                groups[groups.count - 1].append(item)
+            } else {
+                groups.append([item])
+            }
+        }
+        for group in groups.reversed() {
+            if group[0].style.compact {
+                limit = drawStack(group, right: limit) - 10
+                continue
+            }
+            let item = group[0]
+            let label = NSAttributedString(string: item.text, attributes: [.font: text, .foregroundColor: item.style.color ?? cfg.muted])
+            let gauge = item.style.meter ? item.style.gauge : nil
+            let lw = gauge != nil ? 32 : item.text.isEmpty ? 0 : label.size().width + 5
             let dw: CGFloat = item.dot == nil ? 0 : 9
             let w = 16 + dw + lw
             let x0 = limit - w
@@ -269,10 +317,56 @@ final class BarView: NSView {
                 dot.setFill()
                 NSBezierPath(ovalIn: NSRect(x: icon.maxX + 3, y: (bounds.height / 2 - 3).rounded(), width: 6, height: 6)).fill()
             }
-            if lw > 0 { label.draw(at: NSPoint(x: icon.maxX + dw + 5, y: midY(label.size().height))) }
+            if let g = gauge {
+                drawMeter(g, item.style.color ?? cfg.foreground, in: NSRect(x: icon.maxX + dw + 5, y: midY(5), width: 27, height: 5))
+            } else if lw > 0 {
+                label.draw(at: NSPoint(x: icon.maxX + dw + 5, y: midY(label.size().height)))
+            }
             trayRects.append((NSRect(x: x0, y: 0, width: w, height: bounds.height), item.id))
             limit = x0 - 14
         }
+    }
+
+    // Up to two compact entries, one per half of the bar, ending at right; a lone one sits
+    // in the middle. Each row is its own click target. Returns the column's left edge.
+    func drawStack(_ items: [TrayItem], right: CGFloat) -> CGFloat {
+        let rowH = bounds.height / 2
+        let size = (bounds.height / 3).rounded()
+        let font = cfg.font(.semibold, size: size)
+        let meterW: CGFloat = 26
+        let labels = items.map { item in
+            NSAttributedString(string: item.text, attributes: [.font: font, .foregroundColor: item.style.color ?? cfg.foreground])
+        }
+        let widths = items.indices.map { n -> CGFloat in
+            let gauge = items[n].style.meter ? items[n].style.gauge : nil
+            let body = gauge != nil ? meterW : items[n].text.isEmpty ? 0 : labels[n].size().width
+            return size + (body > 0 ? 3 + body : 0)
+        }
+        let x0 = right - (widths.max() ?? 0)
+        for (n, item) in items.enumerated() {
+            let alone = items.count == 1
+            let y = alone ? 0 : n == 0 ? rowH : 0
+            // The rows sit a point toward each other, clear of the bar's edges.
+            let mid = alone ? bounds.height / 2 : y + rowH / 2 + (n == 0 ? -1 : 1)
+            drawIcon(item.icon, in: NSRect(x: x0, y: (mid - size / 2).rounded(), width: size, height: size))
+            if item.style.meter, let g = item.style.gauge {
+                drawMeter(g, item.style.color ?? cfg.foreground, in: NSRect(x: x0 + size + 3, y: (mid - 2).rounded(), width: meterW, height: 4))
+            } else {
+                labels[n].draw(at: NSPoint(x: x0 + size + 3, y: (mid - labels[n].size().height / 2).rounded()))
+            }
+            trayRects.append((NSRect(x: x0, y: y, width: widths[n], height: alone ? bounds.height : rowH), item.id))
+        }
+        return x0
+    }
+
+    func drawMeter(_ gauge: Double, _ color: NSColor, in r: NSRect) {
+        let radius = r.height / 2
+        cfg.muted.withAlphaComponent(0.45).setFill()
+        NSBezierPath(roundedRect: r, xRadius: radius, yRadius: radius).fill()
+        var fill = r
+        fill.size.width = r.width * CGFloat(min(max(gauge, 0), 1))
+        color.setFill()
+        NSBezierPath(roundedRect: fill, xRadius: radius, yRadius: radius).fill()
     }
 }
 
@@ -303,11 +397,14 @@ protocol TrayPlugin: AnyObject {
     func menu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void)
     // Calls changed on the main thread when the state changes outside the bar.
     func watch(_ changed: @escaping () -> Void)
+    // How the text is drawn, when not as plain text. Called off the main thread.
+    func style(_ cfg: BarConfig) -> TrayStyle
 }
 
 extension TrayPlugin {
     func state(_ cfg: BarConfig) -> (NSColor?, String) { (nil, "") }
     func watch(_ changed: @escaping () -> Void) {}
+    func style(_ cfg: BarConfig) -> TrayStyle { TrayStyle() }
 }
 
 final class Tray {
@@ -647,17 +744,46 @@ final class OpenUsage: TrayPlugin {
         return providers
     }
 
-    // Called off the main thread.
-    func state(_ cfg: BarConfig) -> (NSColor?, String) {
-        guard let providers = OpenUsage.providers() else { return (cfg.muted, "") }
+    // What the entry shows, or nil when OpenUsage has no such account or limit.
+    // left is the share of the limit that is left, shown the share that the text gives.
+    func reading(_ cfg: BarConfig) -> (text: String, left: Double?, shown: Double?, stale: Bool)? {
+        guard let providers = OpenUsage.providers() else { return nil }
         let id = providers[provider] != nil ? provider : providers.keys.sorted().first { $0.hasPrefix(provider + "@") }
         guard let account = id.flatMap({ providers[$0] }),
-              let r = (account["resources"] as? [String: [String: Any]])?[limit] else { return (cfg.muted, "") }
+              let r = (account["resources"] as? [String: [String: Any]])?[limit] else { return nil }
+        let used = cfg.openusageShow == "used"
         // A balance has what is available rather than a limit and what remains of it.
-        let value = cfg.openusageShow == "used" ? r["used"] : (r["remaining"] ?? r["available"])
-        guard let n = value as? NSNumber else { return (cfg.muted, "") }
+        guard let n = (used ? r["used"] : (r["remaining"] ?? r["available"])) as? NSNumber else { return nil }
         let text = "\(Int(n.doubleValue.rounded()))" + (r["unit"] as? String == "percent" ? "%" : "")
-        return (account["stale"] as? Bool ?? false ? cfg.muted : nil, text)
+        var left: Double?
+        if let remaining = r["remaining"] as? NSNumber, let max = r["limit"] as? NSNumber, max.doubleValue > 0 {
+            left = remaining.doubleValue / max.doubleValue
+        }
+        let shown = used ? left.map { 1 - $0 } : left
+        return (text, left, shown, account["stale"] as? Bool ?? false)
+    }
+
+    // Called off the main thread.
+    func state(_ cfg: BarConfig) -> (NSColor?, String) {
+        guard let r = reading(cfg) else { return (cfg.muted, "") }
+        return (r.stale ? cfg.muted : nil, r.text)
+    }
+
+    // Called off the main thread.
+    func style(_ cfg: BarConfig) -> TrayStyle {
+        var style = TrayStyle(compact: cfg.openusageLayout == "stacked")
+        guard let r = reading(cfg) else { style.color = cfg.muted; return style }
+        let left = (r.left ?? 1) * 100
+        if r.stale {
+            style.color = cfg.muted
+        } else if cfg.openusageCritical > 0, left <= cfg.openusageCritical {
+            style.color = cfg.openusageCriticalColor
+        } else if cfg.openusageWarn > 0, left <= cfg.openusageWarn {
+            style.color = cfg.openusageWarnColor
+        }
+        style.gauge = r.shown
+        style.meter = cfg.openusageStyle == "meter"
+        return style
     }
 
     func menu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void) {
@@ -804,11 +930,15 @@ final class Bar: NSObject, NSApplicationDelegate {
         let cfg = self.cfg
         DispatchQueue.global().async {
             var found: [String: (NSColor?, String)] = [:]
-            for id in cfg.tray { if let p = self.tray.plugin(id) { found[id] = p.state(cfg) } }
-            let states = found
+            var styles: [String: TrayStyle] = [:]
+            for id in cfg.tray {
+                if let p = self.tray.plugin(id) { found[id] = p.state(cfg); styles[id] = p.style(cfg) }
+            }
+            let states = found, looks = styles
             DispatchQueue.main.async {
                 self.view.tray = cfg.tray.map { id in
-                    TrayItem(id: id, icon: self.tray.icon(id), dot: states[id]?.0 ?? nil, text: states[id]?.1 ?? "")
+                    TrayItem(id: id, icon: self.tray.icon(id), dot: states[id]?.0 ?? nil, text: states[id]?.1 ?? "",
+                             style: looks[id] ?? TrayStyle())
                 }
                 self.view.needsDisplay = true
             }
