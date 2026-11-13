@@ -1,7 +1,7 @@
 // tatami-bar: an optional bar for tatami that sits over the macOS menu bar.
 //
 // Left: an optional logo, the workspaces (click one to switch) and the focused window's
-// title. Right: menu-bar apps of your choice, the battery and the clock. Hover anywhere
+// title. Right: menu-bar apps and tray plugins, the battery and the clock. Hover anywhere
 // but a workspace or an icon for a moment and the bar fades out to show the real menu bar
 // underneath; move the mouse away and it comes back. Hidden while the focused window is
 // native fullscreen.
@@ -12,6 +12,8 @@
 // appearance. "tatami-bar check" validates the file; SIGHUP reloads it.
 import Cocoa
 import IOKit.ps
+import CoreAudio
+import AudioToolbox
 
 func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
@@ -37,6 +39,7 @@ struct BarConfig {
     var title = true
     var hoverReveal = true
     var tray: [String] = []
+    var openusageShow = "remaining"
     var tatami = ""
 
     func font(_ weight: NSFont.Weight) -> NSFont {
@@ -118,8 +121,13 @@ struct BarConfig {
         case "title": return bool { title = $0 }
         case "hover-reveal": return bool { hoverReveal = $0 }
         case "tray":
-            guard !v.isEmpty, !v.contains(" ") else { return "tray: expected one bundle identifier or tailscale, got '\(v)'" }
+            guard !v.isEmpty, !v.contains(" ") else {
+                return "tray: expected one bundle identifier, tailscale, sound or openusage:<provider>, got '\(v)'"
+            }
             tray.append(v)
+        case "openusage-show":
+            guard v == "remaining" || v == "used" else { return "openusage-show: expected remaining or used, got '\(v)'" }
+            openusageShow = v
         case "tatami": tatami = (v as NSString).expandingTildeInPath
         default: return "unknown key '\(key)'"
         }
@@ -174,6 +182,22 @@ final class BarView: NSView {
     }
 
     func midY(_ h: CGFloat) -> CGFloat { ((bounds.height - h) / 2).rounded() }
+
+    // An icon fitted into rect, keeping its shape. A template image (an SF Symbol) takes the
+    // foreground colour, so it follows the palette and dark mode.
+    func drawIcon(_ image: NSImage, in rect: NSRect) {
+        let s = image.size
+        let k = s.width > 0 && s.height > 0 ? min(rect.width / s.width, rect.height / s.height) : 1
+        let fit = NSRect(x: rect.midX - s.width * k / 2, y: rect.midY - s.height * k / 2, width: s.width * k, height: s.height * k)
+        guard image.isTemplate else { image.draw(in: fit); return }
+        let color = cfg.foreground
+        NSImage(size: s, flipped: false) { r in
+            image.draw(in: r)
+            color.set()
+            r.fill(using: .sourceAtop)
+            return true
+        }.draw(in: fit)
+    }
 
     override func draw(_ dirty: NSRect) {
         let bold = cfg.font(.bold), text = cfg.font(.medium)
@@ -240,7 +264,7 @@ final class BarView: NSView {
             let w = 16 + dw + lw
             let x0 = limit - w
             let icon = NSRect(x: x0, y: midY(16), width: 16, height: 16)
-            item.icon.draw(in: icon)
+            drawIcon(item.icon, in: icon)
             if let dot = item.dot {
                 dot.setFill()
                 NSBezierPath(ovalIn: NSRect(x: icon.maxX + 3, y: (bounds.height / 2 - 3).rounded(), width: 6, height: 6)).fill()
@@ -265,27 +289,43 @@ final class ActionItem: NSMenuItem {
 
 // MARK: Tray
 
-// "tray tailscale" gets its own menu built from the Tailscale CLI, with a status dot and
-// the exit node in use. Any other entry is a bundle identifier: its icon while the app
-// runs, as its menu-bar item is there only then, and a click presses that app's real
-// menu-bar item (needs the Accessibility permission).
+// A tray entry is either a plugin, which has its own icon, status dot, text and a menu
+// under its icon ("tray tailscale", "tray sound"), or a bundle identifier: that app's icon
+// while the app runs, as its menu-bar item is there only then, and a click presses the
+// app's real menu-bar item (needs the Accessibility permission).
+// A new plugin conforms to TrayPlugin and is listed in Tray.init.
+protocol TrayPlugin: AnyObject {
+    // The name in bar.conf: "tray <name>".
+    var name: String { get }
+    func icon() -> NSImage
+    // The status dot and text beside the icon. Called off the main thread.
+    func state(_ cfg: BarConfig) -> (NSColor?, String)
+    // Opens the plugin's menu under its icon; refresh redraws the tray.
+    func menu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void)
+    // Calls changed on the main thread when the state changes outside the bar.
+    func watch(_ changed: @escaping () -> Void)
+}
+
+extension TrayPlugin {
+    func state(_ cfg: BarConfig) -> (NSColor?, String) { (nil, "") }
+    func watch(_ changed: @escaping () -> Void) {}
+}
+
 final class Tray {
-    static let tailscaleBundles = ["io.tailscale.ipn.macsys", "io.tailscale.ipn.macos"]
     var icons: [String: NSImage] = [:]
-    var tsStatus: [String: Any] = [:]
+    var plugins: [String: TrayPlugin] = [:]
 
-    lazy var tsCLI: String? = {
-        let candidates = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
-    }()
-
-    func bundle(_ id: String) -> String {
-        if id != "tailscale" { return id }
-        return Tray.tailscaleBundles.first { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil } ?? Tray.tailscaleBundles[0]
+    init() {
+        let all: [TrayPlugin] = [Tailscale(tray: self), Sound()]
+        plugins = Dictionary(uniqueKeysWithValues: all.map { ($0.name, $0) })
     }
 
-    func icon(_ id: String) -> NSImage {
-        let b = bundle(id)
+    // A fixed plugin by name, or one made from the entry itself ("openusage:claude").
+    func plugin(_ id: String) -> TrayPlugin? { plugins[id] ?? OpenUsage(id: id, tray: self) }
+
+    func icon(_ id: String) -> NSImage { plugin(id)?.icon() ?? appIcon(id) }
+
+    func appIcon(_ b: String) -> NSImage {
         if let i = icons[b] { return i }
         var i = NSImage(size: NSSize(width: 16, height: 16))
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: b) { i = NSWorkspace.shared.icon(forFile: url.path) }
@@ -314,6 +354,28 @@ final class Tray {
             NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
         }
     }
+}
+
+// "tray tailscale": a menu of its own from the Tailscale CLI, always under the icon, with a
+// status dot and the exit node in use.
+final class Tailscale: TrayPlugin {
+    static let bundles = ["io.tailscale.ipn.macsys", "io.tailscale.ipn.macos"]
+    let name = "tailscale"
+    unowned let tray: Tray
+    var tsStatus: [String: Any] = [:]
+
+    init(tray: Tray) { self.tray = tray }
+
+    lazy var tsCLI: String? = {
+        let candidates = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }()
+
+    var bundle: String {
+        Tailscale.bundles.first { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) != nil } ?? Tailscale.bundles[0]
+    }
+
+    func icon() -> NSImage { tray.appIcon(bundle) }
 
     func tsRun(_ args: [String]) -> Data {
         guard let cli = tsCLI else { return Data() }
@@ -333,7 +395,7 @@ final class Tray {
     }
 
     // Called off the main thread.
-    func tailscaleState(_ cfg: BarConfig) -> (NSColor?, String) {
+    func state(_ cfg: BarConfig) -> (NSColor?, String) {
         guard let d = (try? JSONSerialization.jsonObject(with: tsRun(["status", "--json"]))) as? [String: Any] else {
             tsStatus = [:]
             return (cfg.muted, "")
@@ -345,7 +407,7 @@ final class Tray {
         return (NSColor.systemGreen, exit.isEmpty ? "" : "↗ \(exit)")
     }
 
-    func tailscaleMenu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void) {
+    func menu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void) {
         let d = tsStatus
         let running = d["BackendState"] as? String == "Running"
         let me = d["Self"] as? [String: Any] ?? [:]
@@ -389,9 +451,253 @@ final class Tray {
         menu.addItem(exitItem)
         menu.addItem(.separator())
         menu.addItem(ActionItem("Admin console") { NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/machines")!) })
-        menu.addItem(ActionItem("Tailscale's own menu…") { DispatchQueue.main.async { self.pressReal(self.bundle("tailscale"), then: refresh) } })
+        menu.addItem(ActionItem("Tailscale's own menu…") { DispatchQueue.main.async { self.tray.pressReal(self.bundle, then: refresh) } })
         menu.popUp(positioning: nil, at: NSPoint(x: rect.minX, y: -4), in: view)
     }
+}
+
+// "tray sound": the sound output devices, as Sound settings lists them; pick one to play
+// through it. Follows changes made elsewhere (Sound settings, plugging in headphones).
+final class Sound: TrayPlugin {
+    let name = "sound"
+    let system = AudioObjectID(kAudioObjectSystemObject)
+    lazy var image: NSImage = {
+        let i = NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: "Sound output")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)) ?? NSImage(size: NSSize(width: 16, height: 16))
+        i.isTemplate = true
+        return i
+    }()
+
+    func icon() -> NSImage { image }
+
+    func address(_ selector: AudioObjectPropertySelector,
+                 _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    // Devices with an output stream that are not hidden, by name.
+    func outputs() -> [(AudioDeviceID, String)] {
+        var a = address(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &a, 0, nil, &size) == noErr else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(system, &a, 0, nil, &size, &ids) == noErr else { return [] }
+        return ids.compactMap { id in
+            var streams = address(kAudioDevicePropertyStreams, kAudioObjectPropertyScopeOutput)
+            var n: UInt32 = 0
+            guard AudioObjectGetPropertyDataSize(id, &streams, 0, nil, &n) == noErr, n > 0 else { return nil }
+            var hidden = address(kAudioDevicePropertyIsHidden)
+            var h: UInt32 = 0
+            var hs = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(id, &hidden, 0, nil, &hs, &h) == noErr, h != 0 { return nil }
+            var nameAddress = address(kAudioObjectPropertyName)
+            var name: Unmanaged<CFString>?
+            var ns = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            guard AudioObjectGetPropertyData(id, &nameAddress, 0, nil, &ns, &name) == noErr,
+                  let s = name?.takeRetainedValue() else { return nil }
+            return (id, s as String)
+        }
+    }
+
+    func current() -> AudioDeviceID {
+        var a = address(kAudioHardwarePropertyDefaultOutputDevice)
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        _ = AudioObjectGetPropertyData(system, &a, 0, nil, &size, &id)
+        return id
+    }
+
+    func select(_ id: AudioDeviceID) {
+        var a = address(kAudioHardwarePropertyDefaultOutputDevice)
+        var v = id
+        let status = AudioObjectSetPropertyData(system, &a, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &v)
+        if status != noErr { log("sound: could not switch output to device \(id): OSStatus \(status)") }
+    }
+
+    // The output's own volume, 0 to 1; nil when it has none macOS can set (an audio
+    // interface with a hardware knob, a multi-output device).
+    func volume(_ id: AudioDeviceID) -> Float? {
+        var a = address(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioObjectPropertyScopeOutput)
+        var settable: DarwinBoolean = false
+        guard AudioObjectHasProperty(id, &a), AudioObjectIsPropertySettable(id, &a, &settable) == noErr,
+              settable.boolValue else { return nil }
+        var v: Float32 = 0
+        var size = UInt32(MemoryLayout<Float32>.size)
+        guard AudioObjectGetPropertyData(id, &a, 0, nil, &size, &v) == noErr else { return nil }
+        return v
+    }
+
+    func setVolume(_ id: AudioDeviceID, _ v: Float) {
+        var a = address(kAudioHardwareServiceDeviceProperty_VirtualMainVolume, kAudioObjectPropertyScopeOutput)
+        var x = Float32(v)
+        _ = AudioObjectSetPropertyData(id, &a, 0, nil, UInt32(MemoryLayout<Float32>.size), &x)
+        // Raising the volume unmutes, as the volume keys do.
+        var m = address(kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput)
+        var muted: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        if v > 0, AudioObjectGetPropertyData(id, &m, 0, nil, &size, &muted) == noErr, muted != 0 {
+            var off: UInt32 = 0
+            _ = AudioObjectSetPropertyData(id, &m, 0, nil, size, &off)
+        }
+    }
+
+    func menu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void) {
+        let now = current()
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let slider = NSMenuItem()
+        if let v = volume(now) {
+            slider.view = VolumeSlider(value: v) { self.setVolume(now, $0) }
+        } else {
+            slider.title = "Volume is set on the device"
+            slider.isEnabled = false
+        }
+        menu.addItem(slider)
+        menu.addItem(.separator())
+        let head = NSMenuItem(title: "Output", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        menu.addItem(head)
+        for (id, name) in outputs() {
+            let item = ActionItem(name) { self.select(id); DispatchQueue.main.async(execute: refresh) }
+            item.state = id == now ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Sound Settings…") {
+            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension")!)
+        })
+        menu.popUp(positioning: nil, at: NSPoint(x: rect.minX, y: -4), in: view)
+    }
+
+    func watch(_ changed: @escaping () -> Void) {
+        for selector in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices] {
+            var a = address(selector)
+            _ = AudioObjectAddPropertyListenerBlock(system, &a, .main) { _, _ in changed() }
+        }
+    }
+}
+
+// "tray openusage:<provider>[.<limit>]": one limit from OpenUsage
+// (github.com/robinebers/openusage), read from the command line tool inside the app. The tool
+// prints what the app last fetched and never fetches or launches anything itself. <provider>
+// is a provider kind (claude, codex, cursor, ...), which takes its first account, or one
+// account's id (codex@1a2b3c4d). <limit> is one of that account's resources, weekly when left
+// out. The icon is the provider's mark from the app; the text is what is left, or what is used
+// with "openusage-show used". A muted dot means the numbers are stale or missing: OpenUsage is
+// not running, its refreshes fail, or it has no such account or limit. A click opens
+// OpenUsage's own panel.
+final class OpenUsage: TrayPlugin {
+    static let bundle = "com.robinebers.openusage"
+    // One run of the tool serves every entry for a while: the app refreshes every 5 minutes.
+    static let lock = NSLock()
+    static var cached: (at: Date, providers: [String: [String: Any]])?
+
+    let name: String
+    let provider: String
+    let limit: String
+    unowned let tray: Tray
+
+    init?(id: String, tray: Tray) {
+        let prefix = "openusage:"
+        guard id.hasPrefix(prefix) else { return nil }
+        let parts = id.dropFirst(prefix.count).split(separator: ".", maxSplits: 1).map(String.init)
+        guard let first = parts.first else { return nil }
+        name = id
+        provider = first
+        limit = parts.count > 1 ? parts[1] : "weekly"
+        self.tray = tray
+    }
+
+    static var app: URL? { NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundle) }
+
+    // The kind names the mark: "codex@1a2b3c4d" is an account of codex.
+    var kind: String { String(provider.split(separator: "@").first ?? "") }
+
+    func icon() -> NSImage {
+        if let i = tray.icons[name] { return i }
+        let marks = "Contents/Resources/OpenUsage_OpenUsage.bundle/Contents/Resources/ProviderIcons"
+        var i = tray.appIcon(OpenUsage.bundle)
+        if let svg = OpenUsage.app?.appendingPathComponent("\(marks)/\(kind).svg"), let mark = NSImage(contentsOf: svg) {
+            // The marks are drawn in currentColor: a template, drawn in the bar's foreground.
+            mark.isTemplate = true
+            i = mark
+        }
+        tray.icons[name] = i
+        return i
+    }
+
+    static func providers() -> [String: [String: Any]]? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let c = cached, Date().timeIntervalSince(c.at) < 30 { return c.providers }
+        guard let cli = app?.appendingPathComponent("Contents/Helpers/openusage").path,
+              FileManager.default.isExecutableFile(atPath: cli) else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: cli)
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        // Nothing fetched yet exits 4 and still prints the envelope, with no providers.
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let providers = json["providers"] as? [String: [String: Any]] else { return nil }
+        cached = (Date(), providers)
+        return providers
+    }
+
+    // Called off the main thread.
+    func state(_ cfg: BarConfig) -> (NSColor?, String) {
+        guard let providers = OpenUsage.providers() else { return (cfg.muted, "") }
+        let id = providers[provider] != nil ? provider : providers.keys.sorted().first { $0.hasPrefix(provider + "@") }
+        guard let account = id.flatMap({ providers[$0] }),
+              let r = (account["resources"] as? [String: [String: Any]])?[limit] else { return (cfg.muted, "") }
+        // A balance has what is available rather than a limit and what remains of it.
+        let value = cfg.openusageShow == "used" ? r["used"] : (r["remaining"] ?? r["available"])
+        guard let n = value as? NSNumber else { return (cfg.muted, "") }
+        let text = "\(Int(n.doubleValue.rounded()))" + (r["unit"] as? String == "percent" ? "%" : "")
+        return (account["stale"] as? Bool ?? false ? cfg.muted : nil, text)
+    }
+
+    func menu(in view: NSView, at rect: NSRect, refresh: @escaping () -> Void) {
+        tray.pressReal(OpenUsage.bundle, then: refresh)
+    }
+}
+
+// A small volume slider for a menu, between a quiet and a loud speaker. On macOS 26 the menu
+// and the slider take the system's Liquid Glass look.
+final class VolumeSlider: NSView {
+    let slider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+    let onChange: (Float) -> Void
+
+    init(value: Float, onChange: @escaping (Float) -> Void) {
+        self.onChange = onChange
+        super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
+        autoresizingMask = [.width]
+        func speaker(_ name: String, _ x: CGFloat, _ mask: NSView.AutoresizingMask) {
+            let v = NSImageView(frame: NSRect(x: x, y: 6, width: 16, height: 16))
+            v.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+            v.contentTintColor = .secondaryLabelColor
+            v.autoresizingMask = mask
+            addSubview(v)
+        }
+        speaker("speaker.fill", 14, [.maxXMargin])
+        speaker("speaker.wave.3.fill", 220 - 14 - 16, [.minXMargin])
+        slider.frame = NSRect(x: 36, y: 4, width: 220 - 72, height: 20)
+        slider.autoresizingMask = [.width]
+        slider.controlSize = .small
+        slider.isContinuous = true
+        slider.floatValue = value
+        slider.target = self
+        slider.action = #selector(changed)
+        addSubview(slider)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc func changed() { onChange(slider.floatValue) }
 }
 
 // MARK: The bar
@@ -458,6 +764,7 @@ final class Bar: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in self.schedule() }
         updateStatus()
         updateTray()
+        for p in tray.plugins.values { p.watch { self.updateTray() } }
         refresh()
         Thread { self.follow() }.start()
     }
@@ -501,12 +808,14 @@ final class Bar: NSObject, NSApplicationDelegate {
     func updateTray() {
         let cfg = self.cfg
         DispatchQueue.global().async {
-            let ts = cfg.tray.contains("tailscale") ? self.tray.tailscaleState(cfg) : (nil, "")
+            var found: [String: (NSColor?, String)] = [:]
+            for id in cfg.tray { if let p = self.tray.plugin(id) { found[id] = p.state(cfg) } }
+            let states = found
             DispatchQueue.main.async {
+                // A plugin always shows; an app only while it runs.
                 self.view.tray = cfg.tray.compactMap { id in
-                    if id == "tailscale" { return TrayItem(id: id, icon: self.tray.icon(id), dot: ts.0, text: ts.1) }
-                    if NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty { return nil }
-                    return TrayItem(id: id, icon: self.tray.icon(id), dot: nil, text: "")
+                    if states[id] == nil, NSRunningApplication.runningApplications(withBundleIdentifier: id).isEmpty { return nil }
+                    return TrayItem(id: id, icon: self.tray.icon(id), dot: states[id]?.0 ?? nil, text: states[id]?.1 ?? "")
                 }
                 self.view.needsDisplay = true
             }
@@ -514,11 +823,11 @@ final class Bar: NSObject, NSApplicationDelegate {
     }
 
     func pressTray(_ id: String) {
-        if id == "tailscale", let r = view.trayRects.first(where: { $0.1 == id })?.0 {
-            tray.tailscaleMenu(in: view, at: r) { self.updateTray() }
+        if let p = tray.plugin(id) {
+            if let r = view.trayRects.first(where: { $0.1 == id })?.0 { p.menu(in: view, at: r) { self.updateTray() } }
             return
         }
-        tray.pressReal(tray.bundle(id)) { self.updateTray() }
+        tray.pressReal(id) { self.updateTray() }
     }
 
     func battery() -> String {
