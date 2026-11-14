@@ -1190,7 +1190,10 @@ final class Bar: NSObject, NSApplicationDelegate {
 // matches what is loaded; the sections are the comment above each group of bindings in
 // tatami.conf, up to the first " (". keys-style picks how a chord's modifiers are written,
 // and keys-colors gives each modifier its own colour.
-struct KeyRow { let mods: [String]; let key: String; let text: String; let code: Bool }
+// run: for "workspace N" or "send N" bound to the key N, the action and the numbers it
+// covers, so that neighbours with the same action can share a row.
+struct KeyRun: Equatable { let action: String; let from: Int; let to: Int }
+struct KeyRow { let mods: [String]; let key: String; let text: String; let code: Bool; var run: KeyRun? = nil }
 struct KeyCard { let title: String; var rows: [KeyRow]; var wide = false }
 
 enum Keys {
@@ -1314,9 +1317,13 @@ enum Keys {
             let title = mode == "main" ? titles[keys] ?? "Other" : "Mode: \(mode)"
             let (mods, key) = chord(keys, style: style)
             let text = meaning(command)
-            let row = KeyRow(mods: mods, key: key, text: text ?? command, code: text == nil)
+            var row = KeyRow(mods: mods, key: key, text: text ?? command, code: text == nil)
+            let words = command.split(separator: " ").map(String.init)
+            if words.count == 2, words[0] == "workspace" || words[0] == "send", let n = Int(words[1]), Int(key) == n {
+                row.run = KeyRun(action: words[0], from: n, to: n)
+            }
             if let i = cards.firstIndex(where: { $0.title == title }) {
-                cards[i].rows = fold(cards[i].rows, row, command)
+                cards[i].rows = fold(cards[i].rows, row)
             } else {
                 cards.append(KeyCard(title: title, rows: [row]))
             }
@@ -1327,18 +1334,19 @@ enum Keys {
         return cards
     }
 
-    // Folds "workspace 2" on ctrl-alt-2 into the row of "workspace 1" on ctrl-alt-1 above it:
-    // "1–2", "Go to workspace 1–2".
-    static func fold(_ rows: [KeyRow], _ row: KeyRow, _ command: String) -> [KeyRow] {
-        guard let last = rows.last, last.mods == row.mods, let n = Int(row.key), last.text.hasSuffix(last.key),
-              command.hasPrefix("workspace ") || command.hasPrefix("send "),
-              let first = last.key.split(separator: "–").first.map(String.init),
-              let end = Int(last.key.split(separator: "–").last ?? ""), end + 1 == n else {
+    // Folds "workspace 2" on ctrl-alt-2 into the row of "workspace 1" on ctrl-alt-1 above
+    // it: "1–2", "Go to workspace 1–2". Only the same action on the same modifiers, each
+    // number on its own key, and only the next number.
+    static func fold(_ rows: [KeyRow], _ row: KeyRow) -> [KeyRow] {
+        guard let last = rows.last, last.mods == row.mods, let prev = last.run, let next = row.run,
+              prev.action == next.action, prev.to + 1 == next.from, last.text.hasSuffix(last.key) else {
             return rows + [row]
         }
-        let range = "\(first)–\(n)"
+        let range = "\(prev.from)–\(next.to)"
         let text = String(last.text.dropLast(last.key.count)) + range
-        return Array(rows.dropLast()) + [KeyRow(mods: row.mods, key: range, text: text, code: false)]
+        return Array(rows.dropLast())
+            + [KeyRow(mods: row.mods, key: range, text: text, code: false,
+                      run: KeyRun(action: prev.action, from: prev.from, to: next.to))]
     }
 }
 
