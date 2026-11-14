@@ -910,7 +910,10 @@ final class Bar: NSObject, NSApplicationDelegate {
         usr1?.setEventHandler { self.toggleKeys() }
         usr1?.resume()
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.keyCode == 53, self.keysPanel?.isVisible == true else { return event }  // Esc
+            // Esc, or q without a modifier.
+            let q = event.charactersIgnoringModifiers == "q"
+                && event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty
+            guard event.keyCode == 53 || q, self.keysPanel?.isVisible == true else { return event }
             self.closeKeys(restore: true)
             return nil
         }
@@ -1185,8 +1188,8 @@ final class Bar: NSObject, NSApplicationDelegate {
 // MARK: Keys
 
 // "tatami-bar keys" (SIGUSR1 to the running bar) shows every key binding tatami has loaded,
-// in a panel in the middle of the screen; Esc, the same command again or a click elsewhere
-// closes it. The bindings come from "query bindings --json" on the socket, so the sheet
+// in a panel in the middle of the screen; Esc, q, the same command again or a click
+// elsewhere closes it. The bindings come from "query bindings --json" on the socket, so the sheet
 // matches what is loaded; the sections are the comment above each group of bindings in
 // tatami.conf, up to the first " (". keys-style picks how a chord's modifiers are written,
 // and keys-colors gives each modifier its own colour.
@@ -1443,7 +1446,7 @@ final class KeysView: NSView {
         if draw { title.draw(at: NSPoint(x: pad, y: pad)) }
         if draw, let h = hint {
             var x = pad + title.size().width + 12
-            let lead = text("Esc or", body, cfg.muted)
+            let lead = text("q, Esc or", body, cfg.muted)
             let mid = pad + title.size().height / 2
             lead.draw(at: NSPoint(x: x, y: mid - lead.size().height / 2))
             x += lead.size().width + 6

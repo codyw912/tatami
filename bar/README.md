@@ -90,7 +90,7 @@ colour.
 ## Key bindings
 
 `tatami-bar keys` shows every key binding tatami has loaded, in a panel in the middle of
-the screen, and hides it when run again; Esc or a click elsewhere hides it too. Bind it in
+the screen, and hides it when run again; Esc, q or a click elsewhere hides it too. Bind it in
 `tatami.conf`:
 
 ```
