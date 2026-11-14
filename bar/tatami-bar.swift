@@ -332,6 +332,8 @@ final class BarView: NSView {
     func drawStack(_ items: [TrayItem], right: CGFloat) -> CGFloat {
         let rowH = bounds.height / 2
         let size = (bounds.height / 3).rounded()
+        // A mark fills its row but for a point above and below, so two marks stay apart.
+        let mark = (rowH - 2).rounded()
         let font = cfg.font(.semibold, size: size)
         let meterW: CGFloat = 26
         let labels = items.map { item in
@@ -340,7 +342,7 @@ final class BarView: NSView {
         let widths = items.indices.map { n -> CGFloat in
             let gauge = items[n].style.meter ? items[n].style.gauge : nil
             let body = gauge != nil ? meterW : items[n].text.isEmpty ? 0 : labels[n].size().width
-            return size + (body > 0 ? 3 + body : 0)
+            return mark + (body > 0 ? 3 + body : 0)
         }
         let x0 = right - (widths.max() ?? 0)
         for (n, item) in items.enumerated() {
@@ -348,11 +350,11 @@ final class BarView: NSView {
             let y = alone ? 0 : n == 0 ? rowH : 0
             // The rows sit a point toward each other, clear of the bar's edges.
             let mid = alone ? bounds.height / 2 : y + rowH / 2 + (n == 0 ? -1 : 1)
-            drawIcon(item.icon, in: NSRect(x: x0, y: (mid - size / 2).rounded(), width: size, height: size))
+            drawIcon(item.icon, in: NSRect(x: x0, y: (mid - mark / 2).rounded(), width: mark, height: mark))
             if item.style.meter, let g = item.style.gauge {
-                drawMeter(g, item.style.color ?? cfg.foreground, in: NSRect(x: x0 + size + 3, y: (mid - 2).rounded(), width: meterW, height: 4))
+                drawMeter(g, item.style.color ?? cfg.foreground, in: NSRect(x: x0 + mark + 3, y: (mid - 2).rounded(), width: meterW, height: 4))
             } else {
-                labels[n].draw(at: NSPoint(x: x0 + size + 3, y: (mid - labels[n].size().height / 2).rounded()))
+                labels[n].draw(at: NSPoint(x: x0 + mark + 3, y: (mid - labels[n].size().height / 2).rounded()))
             }
             trayRects.append((NSRect(x: x0, y: y, width: widths[n], height: alone ? bounds.height : rowH), item.id))
         }
