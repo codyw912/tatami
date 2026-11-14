@@ -9,7 +9,8 @@
 // It talks to tatami through its control socket, as "tatami <command>" does: "events
 // --json" for instant redraws and "query ... --json" for the rest. Configuration is read from
 // ~/.config/tatami/bar.conf (see bar/README.md); without one it follows the system
-// appearance. "tatami-bar check" validates the file; SIGHUP reloads it.
+// appearance. "tatami-bar check" validates the file; SIGHUP reloads it. "tatami-bar keys"
+// (SIGUSR1) shows or hides the key bindings.
 import Cocoa
 import IOKit.ps
 import CoreAudio
@@ -47,6 +48,12 @@ struct BarConfig {
     var openusageCritical = 10.0
     var openusageWarnColor: NSColor = .systemOrange
     var openusageCriticalColor: NSColor = .systemRed
+    var keysStyle = "symbols"
+    var keysColors = false
+    var keysCtrlColor: NSColor = .systemBlue
+    var keysAltColor: NSColor = .systemGreen
+    var keysShiftColor: NSColor = .systemOrange
+    var keysCmdColor: NSColor = .systemPurple
     var tatami = ""
 
     func font(_ weight: NSFont.Weight, size: CGFloat? = nil) -> NSFont {
@@ -147,6 +154,14 @@ struct BarConfig {
             if key == "openusage-warn" { openusageWarn = n } else { openusageCritical = n }
         case "openusage-warn-color": return col { openusageWarnColor = $0 ?? .systemOrange }
         case "openusage-critical-color": return col { openusageCriticalColor = $0 ?? .systemRed }
+        case "keys-style":
+            guard Keys.styles.contains(v) else { return "keys-style: expected symbols, plus, words or mono, got '\(v)'" }
+            keysStyle = v
+        case "keys-colors": return bool { keysColors = $0 }
+        case "keys-ctrl-color": return col { keysCtrlColor = $0 ?? defaults.keysCtrlColor }
+        case "keys-alt-color": return col { keysAltColor = $0 ?? defaults.keysAltColor }
+        case "keys-shift-color": return col { keysShiftColor = $0 ?? defaults.keysShiftColor }
+        case "keys-cmd-color": return col { keysCmdColor = $0 ?? defaults.keysCmdColor }
         case "tatami": tatami = (v as NSString).expandingTildeInPath
         default: return "unknown key '\(key)'"
         }
@@ -843,6 +858,9 @@ final class Bar: NSObject, NSApplicationDelegate {
     var barHeight: CGFloat = 32
     var screenTop: CGFloat = 0
     var hup: DispatchSourceSignal?
+    var usr1: DispatchSourceSignal?
+    var keysPanel: KeysPanel?
+    var keysPrevious: NSRunningApplication?
 
     func loadConfig() {
         let (c, errors) = BarConfig.load()
@@ -886,6 +904,18 @@ final class Bar: NSObject, NSApplicationDelegate {
         hup = DispatchSource.makeSignalSource(signal: SIGHUP, queue: .main)
         hup?.setEventHandler { self.loadConfig(); self.updateStatus(); self.updateTray(); self.refresh() }
         hup?.resume()
+        // "tatami-bar keys": show or hide the key bindings.
+        signal(SIGUSR1, SIG_IGN)
+        usr1 = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        usr1?.setEventHandler { self.toggleKeys() }
+        usr1?.resume()
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.keyCode == 53, self.keysPanel?.isVisible == true else { return event }  // Esc
+            self.closeKeys(restore: true)
+            return nil
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification,
+                                               object: nil, queue: .main) { _ in self.closeKeys(restore: false) }
         Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in self.tick() }
         Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in self.updateStatus() }
         Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { _ in self.updateTray() }
@@ -1152,6 +1182,375 @@ final class Bar: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: Keys
+
+// "tatami-bar keys" (SIGUSR1 to the running bar) shows every key binding tatami has loaded,
+// in a panel in the middle of the screen; Esc, the same command again or a click elsewhere
+// closes it. The bindings come from "query bindings --json" on the socket, so the sheet
+// matches what is loaded; the sections are the comment above each group of bindings in
+// tatami.conf, up to the first " (". keys-style picks how a chord's modifiers are written,
+// and keys-colors gives each modifier its own colour.
+struct KeyRow { let mods: [String]; let key: String; let text: String; let code: Bool }
+struct KeyCard { let title: String; var rows: [KeyRow]; var wide = false }
+
+enum Keys {
+    static let styles = ["symbols", "plus", "words", "mono"]
+    static let order = ["ctrl", "alt", "shift", "cmd"]
+    static let symbols = ["ctrl": "⌃", "alt": "⌥", "shift": "⇧", "cmd": "⌘"]
+    static let keyNames: [String: String] = [
+        "return": "↩", "enter": "↩", "tab": "⇥", "space": "Space", "escape": "⎋", "esc": "⎋",
+        "backspace": "⌫", "delete": "⌦", "left": "←", "right": "→", "up": "↑", "down": "↓",
+        "minus": "-", "equal": "=", "comma": ",", "period": ".", "slash": "/", "backslash": "\\",
+        "semicolon": ";", "grave": "`", "backtick": "`", "home": "Home", "end": "End",
+        "pageup": "PgUp", "pagedown": "PgDn",
+    ]
+    // Outside the symbols style, keys that a keyboard without Mac legends names in words.
+    static let keyWords: [String: String] = [
+        "return": "Return", "enter": "Return", "tab": "Tab", "escape": "Esc", "esc": "Esc",
+        "backspace": "Backspace", "delete": "Delete",
+    ]
+    static let directions = ["west": "left", "east": "right", "north": "up", "south": "down"]
+    // A command and what it does; $1 is the first group, $d its direction in words.
+    static let meanings: [(String, String)] = [
+        ("workspace (\\d+)", "Go to workspace $1"),
+        ("workspace recent", "Previous workspace (back and forth)"),
+        ("workspace prev", "Previous workspace"),
+        ("workspace next", "Next workspace"),
+        ("send (\\d+)", "Move window to workspace $1"),
+        ("send prev", "Move window to the previous workspace"),
+        ("send next", "Move window to the next workspace"),
+        ("focus (west|east|north|south)", "Focus $d"),
+        ("swap (west|east|north|south)", "Swap window $d"),
+        ("warp (west|east|north|south)", "Move window $d"),
+        ("focus-monitor next", "Focus next monitor"),
+        ("focus-monitor recent", "Focus previous monitor"),
+        ("toggle zoom-fullscreen", "Fill the screen (toggle)"),
+        ("toggle zoom-parent", "Fill its half of the split (toggle)"),
+        ("toggle float", "Float or tile the window"),
+        ("toggle accordion", "Stack the workspace's windows (toggle)"),
+        ("toggle split", "Flip the split direction"),
+        ("resize width -(\\d+)", "Narrower by $1 px"),
+        ("resize width (\\d+)", "Wider by $1 px"),
+        ("resize height -(\\d+)", "Shorter by $1 px"),
+        ("resize height (\\d+)", "Taller by $1 px"),
+        ("balance", "Even out every split"),
+        ("reload", "Reload tatami.conf"),
+        ("retile", "Rebuild the layout"),
+        ("exec .*tatami-bar keys.*", "This cheat sheet"),
+    ]
+    static let commands: [(String, String)] = [
+        ("tatami reload", "Read tatami.conf again"),
+        ("tatami query windows", "Every window, its workspace and mode"),
+        ("tatami query bindings", "Every key binding, as loaded"),
+        ("tatami quit", "Bring parked windows back and stop"),
+        ("tatami rescue", "Bring parked windows back without a running tatami"),
+        ("tatami help", "Every command"),
+        ("pkill -HUP tatami-bar", "Reload bar.conf"),
+    ]
+
+    static var configPath: String {
+        let base = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"] ?? NSHomeDirectory() + "/.config"
+        return base + "/tatami/tatami.conf"
+    }
+
+    // "ctrl-alt-shift-h": the modifiers in ctrl, alt, shift, cmd order, and the key's name.
+    static func chord(_ s: String, style: String) -> ([String], String) {
+        var parts = s.split(separator: "-").map(String.init)
+        let key = parts.popLast() ?? ""
+        let mods = parts.map { $0 == "option" ? "alt" : $0 }
+            .sorted { (order.firstIndex(of: $0) ?? 9) < (order.firstIndex(of: $1) ?? 9) }
+        var name = keyNames[key] ?? (key.count == 1 ? key.uppercased() : key)
+        if style != "symbols", let word = keyWords[key] { name = word }
+        return (mods, name)
+    }
+
+    static func meaning(_ command: String) -> String? {
+        for (pattern, text) in meanings {
+            guard let re = try? NSRegularExpression(pattern: "^" + pattern + "$"),
+                  let m = re.firstMatch(in: command, range: NSRange(command.startIndex..., in: command)) else { continue }
+            var out = text
+            if m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: command) {
+                let group = String(command[r])
+                out = out.replacingOccurrences(of: "$1", with: group)
+                out = out.replacingOccurrences(of: "$d", with: directions[group] ?? group)
+            }
+            return out
+        }
+        return nil
+    }
+
+    // The title of the comment line that opens each group of bindings, by chord.
+    static func sections(_ text: String) -> [String: String] {
+        var found: [String: String] = [:]
+        var title = "Other"
+        var blank = true
+        for raw in text.components(separatedBy: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { blank = true; continue }
+            if line.hasPrefix("#") {
+                if blank {
+                    let body = line.drop { $0 == "#" || $0 == " " }
+                    title = String(body.components(separatedBy: " (")[0])
+                }
+                blank = false
+                continue
+            }
+            blank = false
+            let words = line.split(separator: " ").map(String.init)
+            guard words.first == "bind", words.count > 2 else { continue }
+            let chord = words[1].hasPrefix("mode:") ? words[2] : words[1]
+            found[chord] = title
+        }
+        return found
+    }
+
+    static func cards(_ bindings: [[String: Any]], style: String) -> [KeyCard] {
+        let config = (try? String(contentsOfFile: configPath, encoding: .utf8)) ?? ""
+        let titles = sections(config)
+        var cards: [KeyCard] = []
+        for b in bindings {
+            guard let keys = b["keys"] as? String, let command = b["command"] as? String else { continue }
+            let mode = b["mode"] as? String ?? "main"
+            let title = mode == "main" ? titles[keys] ?? "Other" : "Mode: \(mode)"
+            let (mods, key) = chord(keys, style: style)
+            let text = meaning(command)
+            let row = KeyRow(mods: mods, key: key, text: text ?? command, code: text == nil)
+            if let i = cards.firstIndex(where: { $0.title == title }) {
+                cards[i].rows = fold(cards[i].rows, row, command)
+            } else {
+                cards.append(KeyCard(title: title, rows: [row]))
+            }
+        }
+        cards.append(KeyCard(title: "Command line",
+                             rows: commands.map { KeyRow(mods: [], key: $0.0, text: $0.1, code: true) },
+                             wide: true))
+        return cards
+    }
+
+    // Folds "workspace 2" on ctrl-alt-2 into the row of "workspace 1" on ctrl-alt-1 above it:
+    // "1–2", "Go to workspace 1–2".
+    static func fold(_ rows: [KeyRow], _ row: KeyRow, _ command: String) -> [KeyRow] {
+        guard let last = rows.last, last.mods == row.mods, let n = Int(row.key), last.text.hasSuffix(last.key),
+              command.hasPrefix("workspace ") || command.hasPrefix("send "),
+              let first = last.key.split(separator: "–").first.map(String.init),
+              let end = Int(last.key.split(separator: "–").last ?? ""), end + 1 == n else {
+            return rows + [row]
+        }
+        let range = "\(first)–\(n)"
+        let text = String(last.text.dropLast(last.key.count)) + range
+        return Array(rows.dropLast()) + [KeyRow(mods: row.mods, key: range, text: text, code: false)]
+    }
+}
+
+final class KeysPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+// Draws the cards, top down, in up to three columns: each card goes to the shortest column,
+// the command line across the bottom.
+final class KeysView: NSView {
+    var cfg = BarConfig()
+    var cards: [KeyCard] = []
+    var hint: (mods: [String], key: String)?
+    override var isFlipped: Bool { true }
+
+    let pad: CGFloat = 24, gap: CGFloat = 16, inset: CGFloat = 13
+
+    var body: NSFont { cfg.font(.medium) }
+    var keyFont: NSFont { cfg.font(.bold) }
+    var chipFont: NSFont { NSFont.monospacedSystemFont(ofSize: cfg.fontSize - 1.5, weight: .semibold) }
+    var codeFont: NSFont { NSFont.monospacedSystemFont(ofSize: cfg.fontSize - 0.5, weight: .regular) }
+
+    func color(_ mod: String) -> NSColor {
+        guard cfg.keysColors else { return cfg.muted }
+        switch mod {
+        case "ctrl": return cfg.keysCtrlColor
+        case "alt": return cfg.keysAltColor
+        case "shift": return cfg.keysShiftColor
+        default: return cfg.keysCmdColor
+        }
+    }
+
+    func text(_ s: String, _ font: NSFont, _ color: NSColor) -> NSAttributedString {
+        NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: color])
+    }
+
+    // The pieces of a chord, left to right: plain text, or a chip (rounded box) of text.
+    func pieces(_ mods: [String], _ key: String) -> [(NSAttributedString, chip: Bool)] {
+        var out: [(NSAttributedString, chip: Bool)] = []
+        switch cfg.keysStyle {
+        case "symbols":
+            let s = NSMutableAttributedString()
+            for m in mods { s.append(text(Keys.symbols[m] ?? m, keyFont, color(m))) }
+            if !mods.isEmpty { out.append((s, false)) }
+        case "plus":
+            let s = NSMutableAttributedString()
+            for m in mods {
+                s.append(text(m.prefix(1).uppercased() + m.dropFirst(), body, color(m)))
+                s.append(text("+", body, cfg.muted))
+            }
+            if !mods.isEmpty { out.append((s, false)) }
+        case "words":
+            if !mods.isEmpty {
+                let s = NSMutableAttributedString()
+                for (i, m) in mods.enumerated() { s.append(text((i > 0 ? " " : "") + m, body, color(m))) }
+                out.append((s, false))
+            }
+        default:
+            for m in mods { out.append((text(m, chipFont, color(m)), true)) }
+        }
+        out.append((text(key, keyFont, cfg.foreground), true))
+        return out
+    }
+
+    func chordWidth(_ mods: [String], _ key: String) -> CGFloat {
+        pieces(mods, key).reduce(CGFloat(0)) { $0 + $1.0.size().width + ($1.chip ? 10 : 0) + 5 } - 5
+    }
+
+    // Draws a chord ending at right, centred on y. Returns nothing; chordWidth sizes it.
+    func drawChord(_ mods: [String], _ key: String, right: CGFloat, midY: CGFloat) {
+        var x = right - chordWidth(mods, key)
+        let parts = pieces(mods, key)
+        for (i, (s, chip)) in parts.enumerated() {
+            let size = s.size()
+            if chip {
+                let last = i == parts.count - 1
+                let box = NSRect(x: x, y: midY - size.height / 2 - 1, width: size.width + 10, height: size.height + 2)
+                cfg.foreground.withAlphaComponent(last ? 0.16 : 0.08).setFill()
+                NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4).fill()
+                s.draw(at: NSPoint(x: x + 5, y: midY - size.height / 2))
+                x += box.width + 5
+            } else {
+                s.draw(at: NSPoint(x: x, y: midY - size.height / 2))
+                x += size.width + 5
+            }
+        }
+    }
+
+    // Lays out every card in a frame of this width, and draws them when draw is set.
+    // Returns the height the cards need.
+    @discardableResult
+    func render(width: CGFloat, draw: Bool) -> CGFloat {
+        let title = text("tatami", cfg.font(.bold).withSize(cfg.fontSize + 5), cfg.accent)
+        if draw { title.draw(at: NSPoint(x: pad, y: pad)) }
+        if draw, let h = hint {
+            var x = pad + title.size().width + 12
+            let lead = text("Esc or", body, cfg.muted)
+            let mid = pad + title.size().height / 2
+            lead.draw(at: NSPoint(x: x, y: mid - lead.size().height / 2))
+            x += lead.size().width + 6
+            let w = chordWidth(h.mods, h.key)
+            drawChord(h.mods, h.key, right: x + w, midY: mid)
+            text("closes", body, cfg.muted).draw(at: NSPoint(x: x + w + 6, y: mid - lead.size().height / 2))
+        }
+        let top = pad + title.size().height + 14
+        let n = width >= 900 ? 3 : 2
+        let colW = (width - 2 * pad - CGFloat(n - 1) * gap) / CGFloat(n)
+        var heights = [CGFloat](repeating: top, count: n)
+        for card in cards where !card.wide {
+            let col = heights.indices.min { heights[$0] < heights[$1] } ?? 0
+            let x = pad + CGFloat(col) * (colW + gap)
+            heights[col] += cardHeight(card, x: x, y: heights[col], width: colW, draw: draw) + gap
+        }
+        var y = heights.max() ?? top
+        for card in cards where card.wide {
+            y += cardHeight(card, x: pad, y: y, width: width - 2 * pad, draw: draw) + gap
+        }
+        return y - gap + pad
+    }
+
+    func cardHeight(_ card: KeyCard, x: CGFloat, y: CGFloat, width: CGFloat, draw: Bool) -> CGFloat {
+        let head = text(card.title.uppercased(), cfg.font(.bold).withSize(cfg.fontSize - 1.5), cfg.accent)
+        var cy = y + inset + head.size().height + 8
+        let keyW = card.rows.map { row -> CGFloat in
+            card.wide ? text(row.key, codeFont, cfg.foreground).size().width : chordWidth(row.mods, row.key)
+        }.max() ?? 0
+        let textX = x + inset + keyW + 14
+        let textW = x + width - inset - textX
+        var rows: [(KeyRow, CGFloat, CGFloat)] = []
+        for row in card.rows {
+            let s = text(row.text, row.code && !card.wide ? codeFont : body, cfg.foreground)
+            let h = max(s.boundingRect(with: NSSize(width: textW, height: 1000), options: [.usesLineFragmentOrigin]).height,
+                        body.ascender - body.descender + 4)
+            rows.append((row, cy, h))
+            cy += h + 5
+        }
+        let height = cy - 5 + inset - y
+        guard draw else { return height }
+        cfg.foreground.withAlphaComponent(0.05).setFill()
+        NSBezierPath(roundedRect: NSRect(x: x, y: y, width: width, height: height), xRadius: 10, yRadius: 10).fill()
+        head.draw(at: NSPoint(x: x + inset, y: y + inset))
+        for (row, ry, h) in rows {
+            let lineMid = ry + (body.ascender - body.descender) / 2 + 2
+            if card.wide {
+                text(row.key, codeFont, cfg.accent).draw(at: NSPoint(x: x + inset, y: ry + 2))
+            } else {
+                drawChord(row.mods, row.key, right: x + inset + keyW, midY: lineMid)
+            }
+            let s = text(row.text, row.code && !card.wide ? codeFont : body, cfg.foreground)
+            s.draw(with: NSRect(x: textX, y: ry + 2, width: textW, height: h), options: [.usesLineFragmentOrigin])
+        }
+        return height
+    }
+
+    override func draw(_ dirty: NSRect) {
+        // Opaque, even when the bar's background lets the menu bar show through.
+        cfg.background.withAlphaComponent(1).setFill()
+        bounds.fill()
+        render(width: bounds.width, draw: true)
+    }
+}
+
+extension Bar {
+    func toggleKeys() {
+        if let p = keysPanel, p.isVisible { closeKeys(restore: true); return }
+        let cfg = self.cfg
+        DispatchQueue.global().async {
+            let bindings = self.json("query bindings --json")?["bindings"] as? [[String: Any]] ?? []
+            DispatchQueue.main.async { self.showKeys(bindings, cfg) }
+        }
+    }
+
+    func showKeys(_ bindings: [[String: Any]], _ cfg: BarConfig) {
+        let view = KeysView()
+        view.cfg = cfg
+        view.cards = Keys.cards(bindings, style: cfg.keysStyle)
+        if let own = bindings.first(where: { ($0["command"] as? String ?? "").contains("tatami-bar keys") }),
+           let k = own["keys"] as? String {
+            view.hint = Keys.chord(k, style: cfg.keysStyle)
+        }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main ?? NSScreen.screens[0]
+        let area = screen.visibleFrame
+        let width = min(1080, area.width - 80)
+        let height = min(view.render(width: width, draw: false), area.height - 80)
+        let frame = NSRect(x: area.midX - width / 2, y: area.midY - height / 2, width: width, height: height)
+        let panel = keysPanel ?? KeysPanel(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 12
+        view.layer?.masksToBounds = true
+        panel.contentView = view
+        panel.setFrame(frame, display: true)
+        keysPanel = panel
+        keysPrevious = NSWorkspace.shared.frontmostApplication
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    // restore gives focus back to the app that had it; a click elsewhere has moved it already.
+    func closeKeys(restore: Bool) {
+        guard let p = keysPanel, p.isVisible else { return }
+        p.orderOut(nil)
+        if restore { keysPrevious?.activate() }
+        keysPrevious = nil
+    }
+}
+
 if CommandLine.arguments.count > 1 {
     switch CommandLine.arguments[1] {
     case "check":
@@ -1159,8 +1558,18 @@ if CommandLine.arguments.count > 1 {
         for e in errors { print(e) }
         print(errors.isEmpty ? "\(BarConfig.path): ok" : "\(errors.count) error(s); those lines are skipped")
         exit(errors.isEmpty ? 0 : 1)
+    case "keys":
+        // The running bar shows or hides the sheet. This process is a tatami-bar too.
+        signal(SIGUSR1, SIG_IGN)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        p.arguments = ["-USR1", "-x", "tatami-bar"]
+        try? p.run()
+        p.waitUntilExit()
+        if p.terminationStatus != 0 { print("tatami-bar is not running") }
+        exit(p.terminationStatus == 0 ? 0 : 1)
     default:
-        print("usage: tatami-bar [check]\n  reads \(BarConfig.path); kill -HUP reloads it")
+        print("usage: tatami-bar [check | keys]\n  reads \(BarConfig.path); kill -HUP reloads it\n  keys shows or hides the key bindings")
         exit(CommandLine.arguments[1] == "help" || CommandLine.arguments[1] == "--help" ? 0 : 2)
     }
 }

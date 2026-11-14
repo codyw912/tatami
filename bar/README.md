@@ -86,3 +86,24 @@ conforms to `TrayPlugin` (a name, an icon, an optional status dot and text, and 
 and is listed in `Tray.init`, or made from the entry by `Tray.plugin` when the entry
 names what to show. A template image such as an SF Symbol is drawn in the `foreground`
 colour.
+
+## Key bindings
+
+`tatami-bar keys` shows every key binding tatami has loaded, in a panel in the middle of
+the screen, and hides it when run again; Esc or a click elsewhere hides it too. Bind it in
+`tatami.conf`:
+
+```
+bind ctrl-alt-shift-slash : exec ~/.local/bin/tatami-bar keys
+```
+
+The bindings come from tatami over its socket, so the sheet shows what is loaded. Each
+group is titled with the comment above it in `tatami.conf`, up to the first " (". Known
+commands read in words ("Swap window left"), and runs such as `workspace 1` to `workspace
+9` on one set of modifiers share a row. A short list of command-line commands closes it.
+
+`keys-style` sets how a chord's modifiers are written; the final key always has a chip of
+its own: `symbols` (⌃⌥⇧, the default), `plus` (Ctrl+Alt+Shift+), `words` (ctrl alt
+shift) or `mono` (a small chip for each). Outside `symbols`, Return, Tab and Esc are
+spelled out and arrows stay arrows. `keys-colors on` gives each modifier a colour of its
+own: `keys-ctrl-color`, `keys-alt-color`, `keys-shift-color` and `keys-cmd-color`.
