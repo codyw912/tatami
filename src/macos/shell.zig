@@ -1292,6 +1292,9 @@ fn timer_fired(fired: Ref, info: ?*anyopaque) callconv(.c) void {
     for (&apps) |*app| {
         if (app.pid != 0 and !app.ready and app.retry_at_ms != 0 and app.retry_at_ms <= now) {
             app_observe(app);
+            // Focus it took while it could not answer went unheard: focused_window_id
+            // reads nothing for an application that is not ready.
+            if (app.ready) focus_notify();
         }
     }
     if (drag_poll_at_ms != 0 and drag_poll_at_ms <= now) {
